@@ -3,6 +3,11 @@
   "version": "1.0.0",
   "description": "Backend proxy service for election counting data with AES encryption",
   "private": true,
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=10.0.0"
+  },
+  "packageManager": "pnpm@10.12.4",
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
@@ -19,5 +24,10 @@
     "@types/node": "^22.0.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.3"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
   }
 }
