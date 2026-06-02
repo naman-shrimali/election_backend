@@ -14,10 +14,11 @@
     "start": "node dist/index.js"
   },
   "dependencies": {
+    "@sparticuz/chromium": "^149.0.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "puppeteer": "^25.1.0"
+    "puppeteer-core": "^25.1.0"
   },
   "devDependencies": {
     "@types/cors": "^2.8.17",

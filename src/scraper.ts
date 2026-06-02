@@ -10,9 +10,8 @@
  *   2. Notice banner   (div.notice-marquee span text)   → noticeCache
  */
 
-import puppeteer, { type Browser, type Page } from "puppeteer"
-import os from "os"
-import path from "path"
+import chromium from "@sparticuz/chromium"
+import puppeteer, { type Browser, type Page } from "puppeteer-core"
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -99,48 +98,21 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
 
   console.log("[scraper] Launching Puppeteer...")
 
-  // Resolve Chromium executable path.
-  // On Heroku (with jontewks/puppeteer-heroku-buildpack), Puppeteer's own
-  // bundled Chromium is downloaded during `pnpm install` at build time and
-  // lives inside the slug. executablePath() returns the correct path.
-  let executablePath: string | undefined
-  try {
-    executablePath = await puppeteer.executablePath()
-  } catch {
-    // Fallback for environments where the async call fails
-    const version = "149.0.7827.22"
-    const platform =
-      process.platform === "darwin"
-        ? process.arch === "arm64" ? "mac_arm" : "mac"
-        : process.platform === "win32" ? "win64" : "linux"
-
-    const binaryMap: Record<string, string> = {
-      linux:   `chrome/linux-${version}/chrome-linux64/chrome`,
-      mac_arm: `chrome/mac_arm-${version}/chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`,
-      mac:     `chrome/mac-${version}/chrome-mac-x64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`,
-      win64:   `chrome/win64-${version}/chrome-win64/chrome.exe`,
-    }
-
-    executablePath = path.join(
-      os.homedir(), ".cache", "puppeteer",
-      binaryMap[platform] ?? binaryMap["linux"]
-    )
-  }
-
+  // @sparticuz/chromium provides a pre-built Chromium binary for Linux cloud
+  // environments (Heroku, Lambda, etc.). executablePath() extracts and returns
+  // the path — no buildpack or manual Chrome download needed.
+  const executablePath = await chromium.executablePath()
   console.log(`[scraper] Chrome: ${executablePath}`)
 
   browser = await puppeteer.launch({
-    headless: true,
-    executablePath,
     args: [
-      "--no-sandbox",
-      "--disable-setuid-sandbox",
-      "--disable-dev-shm-usage",
-      "--disable-gpu",
-      "--single-process",           // reduces memory on Heroku
+      ...chromium.args,
       "--disable-application-cache",
       "--disable-cache",
     ],
+    defaultViewport: { width: 1280, height: 900 },
+    executablePath,
+    headless: true,
   })
 
   page = await browser.newPage()
