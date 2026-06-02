@@ -129,7 +129,7 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
   await page.setViewport({ width: 1280, height: 900 })
   await page.setUserAgent(
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-      "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   )
 
   console.log(`[scraper] Navigating to ${TARGET_URL}...`)
@@ -181,7 +181,8 @@ async function extractPageData(pg: Page): Promise<RawPageData> {
       : null
 
     return { frameNumber, rows, noticeText }
-  })}
+  })
+}
 
 // ─── Row Parsing ──────────────────────────────────────────────────────────────
 
@@ -312,8 +313,8 @@ async function runScrapeCycle(): Promise<void> {
 
       console.log(
         `[scraper] Frame ${data.frameNumber}${isNew ? " (new)" : ""} — ` +
-          `${merged.length} candidates | #1: ${merged[0]?.name ?? "?"} ` +
-          `Ballot ${merged[0]?.serial} ${merged[0]?.votes}v`
+        `${merged.length} candidates | #1: ${merged[0]?.name ?? "?"} ` +
+        `Ballot ${merged[0]?.serial} ${merged[0]?.votes}v`
       )
 
       // Reset after full rotation so vote counts keep refreshing
@@ -353,7 +354,7 @@ export function startScraperLoop(): void {
   isRunning = true
   console.log(
     `[scraper] Starting — interval ${SCRAPE_INTERVAL_MS / 1000}s, ` +
-      `target ${TARGET_URL}`
+    `target ${TARGET_URL}`
   )
 
   // First cycle fires immediately (fire-and-forget)
@@ -367,7 +368,7 @@ export function stopScraperLoop(): void {
     scraperTimer = null
   }
   if (browser) {
-    browser.close().catch(() => {})
+    browser.close().catch(() => { })
     browser = null
     page = null
   }
