@@ -1,9 +1,18 @@
 /**
  * scraper.ts  (election_backend)
  *
- * Persistent Puppeteer browser that scrapes counting2026.com every
- * SCRAPE_INTERVAL_MS milliseconds. Results are stored in memory and
- * served by the Express routes — no file I/O needed.
+ * Persistent Puppeteer browser that scrapes counting2026.com.
+ * Results are stored in memory and served by the Express routes.
+ *
+ * Strategy:
+ *   - counting2026.com rotates through 12 frames on its own timer (~30s/frame).
+ *   - We poll the live DOM every FRAME_POLL_MS (10s) WITHOUT reloading the page,
+ *     so we catch each frame as the site naturally advances it.
+ *   - Each new frame's rows are merged into the candidate cache.
+ *   - Only after seeing ALL 12 frames do we do a full page.reload() to get fresh
+ *     vote counts, then start the next collection pass.
+ *   - The frontend /api/pulse will return whatever candidates have been collected
+ *     so far, along with framesCollected/totalFrames so the UI can show progress.
  *
  * Extracts:
  *   1. Candidate rows  (ballot no, name, votes, place)  → candidateCache
@@ -20,20 +29,21 @@ const TARGET_URL =
 
 const TOTAL_FRAMES = 12
 
-export const SCRAPE_INTERVAL_MS = Number(
-  process.env.SCRAPE_INTERVAL_MS ?? 30_000
-)
+// How often to poll the DOM for a frame change (no page reload)
+const FRAME_POLL_MS = 10_000
 
-// How long to wait after page.reload() for the site's own React/data-fetch
-// to complete before we read the DOM.
-const POST_RELOAD_SETTLE_MS = 8_000
+// How long to wait after a full-rotation reload for React to re-render
+const POST_RELOAD_SETTLE_MS = 10_000
+
+// Exported so the API route can include it in the response
+export const SCRAPE_INTERVAL_MS = FRAME_POLL_MS
 
 // ─── Public Types ─────────────────────────────────────────────────────────────
 
 export type Candidate = {
   id: number
   rank: number
-  serial: string       // ballot number (e.g. "182")
+  serial: string
   name: string
   place: string
   barAssociation: string
@@ -49,14 +59,14 @@ export type Candidate = {
 
 export type CandidateCache = {
   candidates: Candidate[]
-  updatedAt: string         // ISO timestamp of last successful scrape
+  updatedAt: string
   framesCollected: number
   totalFrames: number
 }
 
 export type NoticeCache = {
   text: string
-  maintenanceMode: boolean  // true when notice mentions counting stop/halt
+  maintenanceMode: boolean
   updatedAt: string
 }
 
@@ -78,7 +88,14 @@ export function getNoticeCache(): NoticeCache | null {
 let browser: Browser | null = null
 let page: Page | null = null
 let scraperTimer: ReturnType<typeof setTimeout> | null = null
+
+// Tracks which frames have been captured in the current pass
 let visitedFrames: Set<string> = new Set()
+
+// When true, the next cycle will do a full page.reload() before reading
+// This is set on startup and after every complete 12-frame rotation
+let pendingReload = true
+
 let isRunning = false
 let isScraping = false
 
@@ -98,9 +115,6 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
 
   console.log("[scraper] Launching Puppeteer...")
 
-  // @sparticuz/chromium provides a pre-built Chromium binary for Linux cloud
-  // environments (Heroku, Lambda, etc.). executablePath() extracts and returns
-  // the path — no buildpack or manual Chrome download needed.
   const executablePath = await chromium.executablePath()
   console.log(`[scraper] Chrome: ${executablePath}`)
 
@@ -117,10 +131,7 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
 
   page = await browser.newPage()
 
-  // Disable HTTP cache so every reload fetches fresh data from the server
   await page.setCacheEnabled(false)
-
-  // Strip any cache-friendly headers the site might set on responses
   await page.setExtraHTTPHeaders({
     "Cache-Control": "no-cache, no-store, must-revalidate",
     Pragma: "no-cache",
@@ -136,6 +147,13 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
   await page.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 60_000 })
   console.log("[scraper] Initial page load complete.")
 
+  // Initial load already counts as the reload
+  pendingReload = false
+
+  // Settle so the React app can render the first frame
+  console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s after initial load...`)
+  await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
+
   return { browser, page: page! }
 }
 
@@ -147,25 +165,18 @@ type RawPageData = {
   noticeText: string | null
 }
 
-async function extractPageData(pg: Page): Promise<RawPageData> {
-  // Full reload ensures counting2026.com's own APIs re-fetch fresh vote data
-  console.log("[scraper] Reloading page for fresh data...")
-  await pg.reload({ waitUntil: "networkidle2", timeout: 60_000 })
-
-  // Let the site's React app finish fetching and rendering
-  console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s...`)
-  await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
-
+/**
+ * Read the current DOM state without reloading the page.
+ * The site rotates frames on its own schedule; we just snapshot whatever
+ * frame is currently displayed.
+ */
+async function readCurrentDOM(pg: Page): Promise<RawPageData> {
   return pg.evaluate((): RawPageData => {
     const bodyText = document.body?.innerText ?? ""
 
-    // The site shows "Frame X/12" in the UI — we use this to track coverage
     const frameMatch = bodyText.match(/Frame\s+(\d+)\/(\d+)/i)
     const frameNumber = frameMatch ? frameMatch[1] : null
 
-    // Candidate rows: <article class*="grid-cols"> or <div class*="grid-cols">
-    // Each row's innerText (after filter) is:
-    //   parts[0]=SrNo  parts[1]=BallotNo  parts[2]=Name  parts[3]=Votes  parts[4]=Place
     const rows = Array.from(
       document.querySelectorAll(
         'article[class*="grid-cols"], div[class*="grid-cols"]'
@@ -174,7 +185,6 @@ async function extractPageData(pg: Page): Promise<RawPageData> {
       .map((r) => (r as HTMLElement).innerText)
       .filter((t) => /^\d+\n\d+/.test(t))
 
-    // Notice banner: <div class="notice-marquee ..."><span>text</span></div>
     const noticeEl = document.querySelector("div.notice-marquee span")
     const noticeText = noticeEl
       ? (noticeEl as HTMLElement).innerText.trim()
@@ -182,6 +192,17 @@ async function extractPageData(pg: Page): Promise<RawPageData> {
 
     return { frameNumber, rows, noticeText }
   })
+}
+
+/**
+ * Full page reload — only called after a complete 12-frame rotation to
+ * force counting2026.com to re-fetch the latest vote counts from its API.
+ */
+async function reloadForFreshData(pg: Page): Promise<void> {
+  console.log("[scraper] Full rotation complete — reloading for fresh vote counts...")
+  await pg.reload({ waitUntil: "networkidle2", timeout: 60_000 })
+  console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s...`)
+  await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
 }
 
 // ─── Row Parsing ──────────────────────────────────────────────────────────────
@@ -193,12 +214,7 @@ function parseRows(rawRows: string[]): Partial<Candidate>[] {
       .map((x) => x.trim())
       .filter(Boolean)
 
-    // After filter(Boolean) the layout is:
-    //   parts[0] = Sr. No.    (site rank — discarded)
-    //   parts[1] = Ballot No. → serial
-    //   parts[2] = Name
-    //   parts[3] = Votes      ← votes BEFORE place in the DOM
-    //   parts[4] = Place
+    // parts[0]=SrNo  parts[1]=BallotNo  parts[2]=Name  parts[3]=Votes  parts[4]=Place
     return {
       serial: parts[1] || "",
       name: parts[2] || "",
@@ -277,9 +293,19 @@ async function runScrapeCycle(): Promise<void> {
 
   try {
     const { page: pg } = await ensureBrowser()
-    const data = await extractPageData(pg)
 
-    // ── Update notice cache ──────────────────────────────────────────────────
+    // Only do a full reload if a complete rotation just finished
+    // (pendingReload is set after 12 frames are seen, or on errors)
+    if (pendingReload) {
+      await reloadForFreshData(pg)
+      pendingReload = false
+    }
+
+    // Read the current DOM without touching the page —
+    // the site's own timer advances the frame automatically
+    const data = await readCurrentDOM(pg)
+
+    // ── Update notice cache ────────────────────────────────────────────────────
     if (data.noticeText !== null) {
       const STOP_PATTERNS = [/counting\s+stop/i, /halt/i, /suspended/i]
       const maintenanceMode = STOP_PATTERNS.some((p) =>
@@ -290,48 +316,57 @@ async function runScrapeCycle(): Promise<void> {
         maintenanceMode,
         updatedAt: new Date().toISOString(),
       }
-      console.log(
-        `[scraper] Notice: "${data.noticeText.slice(0, 80)}${data.noticeText.length > 80 ? "..." : ""}"`
-      )
     }
 
-    // ── Update candidate cache ───────────────────────────────────────────────
+    // ── Update candidate cache ─────────────────────────────────────────────────
     if (data.frameNumber && data.rows.length > 0) {
       const isNew = !visitedFrames.has(data.frameNumber)
-      if (isNew) visitedFrames.add(data.frameNumber)
 
-      const parsed = parseRows(data.rows)
-      const existing = candidateCache?.candidates ?? []
-      const merged = mergeAndRank(existing, parsed)
+      if (isNew) {
+        visitedFrames.add(data.frameNumber)
 
-      candidateCache = {
-        candidates: merged,
-        updatedAt: new Date().toISOString(),
-        framesCollected: visitedFrames.size,
-        totalFrames: TOTAL_FRAMES,
-      }
+        const parsed = parseRows(data.rows)
+        const existing = candidateCache?.candidates ?? []
+        const merged = mergeAndRank(existing, parsed)
 
-      console.log(
-        `[scraper] Frame ${data.frameNumber}${isNew ? " (new)" : ""} — ` +
-        `${merged.length} candidates | #1: ${merged[0]?.name ?? "?"} ` +
-        `Ballot ${merged[0]?.serial} ${merged[0]?.votes}v`
-      )
+        candidateCache = {
+          candidates: merged,
+          updatedAt: new Date().toISOString(),
+          framesCollected: visitedFrames.size,
+          totalFrames: TOTAL_FRAMES,
+        }
 
-      // Reset after full rotation so vote counts keep refreshing
-      if (visitedFrames.size >= TOTAL_FRAMES) {
-        visitedFrames.clear()
-        console.log("[scraper] Full rotation — resetting frame tracker")
+        console.log(
+          `[scraper] ✅ Frame ${data.frameNumber}/${TOTAL_FRAMES} — ` +
+          `${merged.length} total candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
+        )
+
+        // After all 12 frames: flag for a fresh reload on the next cycle
+        if (visitedFrames.size >= TOTAL_FRAMES) {
+          console.log(
+            `[scraper] 🔄 All ${TOTAL_FRAMES} frames collected (${merged.length} candidates). ` +
+            `Will reload for fresh vote data.`
+          )
+          visitedFrames.clear()
+          pendingReload = true
+        }
+      } else {
+        // Same frame still showing — just log so we know we're alive
+        console.log(
+          `[scraper] Frame ${data.frameNumber} (waiting for rotation… ` +
+          `${visitedFrames.size}/${TOTAL_FRAMES} frames captured)`
+        )
       }
     } else {
       console.warn(
-        `[scraper] Could not extract frame data (frameNumber=${data.frameNumber}, rows=${data.rows.length})`
+        `[scraper] No frame data (frameNumber=${data.frameNumber}, rows=${data.rows.length})`
       )
     }
   } catch (err) {
     console.error("[scraper] Cycle error:", err)
-    // Reset browser so the next cycle gets a fresh one
     browser = null
     page = null
+    pendingReload = true   // force fresh load on recovery
   } finally {
     isScraping = false
   }
@@ -343,7 +378,7 @@ function scheduleNext(): void {
   scraperTimer = setTimeout(async () => {
     await runScrapeCycle()
     scheduleNext()
-  }, SCRAPE_INTERVAL_MS)
+  }, FRAME_POLL_MS)
 }
 
 export function startScraperLoop(): void {
@@ -353,11 +388,10 @@ export function startScraperLoop(): void {
   }
   isRunning = true
   console.log(
-    `[scraper] Starting — interval ${SCRAPE_INTERVAL_MS / 1000}s, ` +
+    `[scraper] Starting — polling every ${FRAME_POLL_MS / 1000}s, ` +
     `target ${TARGET_URL}`
   )
 
-  // First cycle fires immediately (fire-and-forget)
   runScrapeCycle().then(() => scheduleNext())
 }
 
