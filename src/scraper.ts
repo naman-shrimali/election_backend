@@ -142,6 +142,23 @@ let pendingReload = true
 let isRunning = false
 let isScraping = false
 
+// ─── Network API capture ──────────────────────────────────────────────────────
+// When counting2026.com's React app fetches candidate data, we intercept the
+// JSON response and store it here. This makes the scraper independent of
+// whether the React app manages to render its DOM grid — which can fail if
+// the site's API blocks datacenter IPs (common on AWS/Heroku ranges).
+type NetworkCandidate = {
+  name?: string
+  ballot?: number | string
+  votes?: number | string
+  place?: string
+  rank?: number | string
+  [key: string]: unknown
+}
+let capturedNetworkCandidates: NetworkCandidate[] | null = null
+let capturedNetworkFrame: string | null = null
+let capturedApiUrl: string | null = null
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
 const GRID_SELECTOR =
@@ -196,30 +213,57 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
       ...chromium.args,
       "--disable-application-cache",
       "--disable-cache",
+      // Bot-evasion: prevents navigator.webdriver being set to true
+      "--disable-blink-features=AutomationControlled",
     ],
     defaultViewport: { width: 1280, height: 900 },
     executablePath,
     headless: true,
-    timeout: 30_000,   // fail fast if Chrome process doesn't become responsive
+    timeout: 30_000,
   })
 
   page = await browser.newPage()
 
-  await page.setCacheEnabled(false)
-  await page.setExtraHTTPHeaders({
-    "Cache-Control": "no-cache, no-store, must-revalidate",
-    Pragma: "no-cache",
+  // Patch navigator.webdriver so the site doesn't detect headless Chrome
+  await page.evaluateOnNewDocument(() => {
+    Object.defineProperty(navigator, "webdriver", { get: () => false })
   })
 
-  await page.setViewport({ width: 1280, height: 900 })
-  await page.setUserAgent(
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-  )
+  // ── Network response interception ───────────────────────────────────────────
+  // Capture JSON responses from counting2026.com so we can read candidate data
+  // directly from the API, regardless of whether React renders the DOM grid.
+  await page.setRequestInterception(true)
+  page.on("request", (req) => req.continue())
+  page.on("response", async (response) => {
+    const url = response.url()
+    if (!url.includes("counting2026.com")) return
+    const ct = response.headers()["content-type"] ?? ""
+    if (!ct.includes("json")) return
+    if (response.status() !== 200) return
+    try {
+      const body = await response.text()
+      console.log(`[scraper] JSON from: ${url.slice(0, 100)}`)
+      const json = JSON.parse(body)
+      // Try to extract candidate array regardless of exact API shape
+      const arr: NetworkCandidate[] = Array.isArray(json)
+        ? json
+        : (json.candidates ?? json.data ?? json.results ?? null)
+      if (Array.isArray(arr) && arr.length > 0) {
+        const first = arr[0]
+        // Must look like a candidate object
+        if ("name" in first || "ballot" in first || "votes" in first) {
+          console.log(`[scraper] ✅ Network capture: ${arr.length} candidates from ${url.slice(0, 80)}`)
+          capturedNetworkCandidates = arr
+          capturedApiUrl = url
+        }
+      }
+      // Also try to find frame number in the response
+      if (typeof json === "object" && (json.frame || json.frameNumber)) {
+        capturedNetworkFrame = String(json.frame ?? json.frameNumber)
+      }
+    } catch { /* ignore parse errors */ }
+  })
 
-  // domcontentloaded fires as soon as HTML is parsed — reliable for SPAs.
-  // networkidle2 waits for <2 network connections, which is NEVER true for
-  // sites that constantly poll their own API (like counting2026.com).
   await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 30_000 })
   console.log("[scraper] DOM loaded.")
 
@@ -240,7 +284,27 @@ type RawPageData = {
   frameNumber: string | null
   rows: string[]
   noticeText: string | null
+  // Populated only when rows=0 to help debug selector mismatches
+  diagnostics?: {
+    bodyPreview: string
+    selectorsTried: string[]
+    matchCounts: Record<string, number>
+    gridClassSamples: string[]
+    tagSamples: string[]
+  }
 }
+
+// All selectors to try, in priority order.
+// We log which one matched so we can narrow down the correct one from logs.
+const ROW_SELECTORS = [
+  'article[class*="grid-cols"]',
+  'div[class*="grid-cols"]',
+  'li[class*="grid-cols"]',
+  'tr[class*="grid-cols"]',
+  '[class*="grid-cols"]',             // any element
+  '[class*="candidate"]',
+  'tbody tr',                         // plain table rows
+]
 
 /**
  * Read the current DOM state without reloading the page.
@@ -248,27 +312,53 @@ type RawPageData = {
  * frame is currently displayed.
  */
 async function readCurrentDOM(pg: Page): Promise<RawPageData> {
-  return pg.evaluate((): RawPageData => {
+  return pg.evaluate((selectors: string[]): RawPageData => {
     const bodyText = document.body?.innerText ?? ""
 
     const frameMatch = bodyText.match(/Frame\s+(\d+)\/(\d+)/i)
     const frameNumber = frameMatch ? frameMatch[1] : null
 
-    const rows = Array.from(
-      document.querySelectorAll(
-        'article[class*="grid-cols"], div[class*="grid-cols"]'
-      )
-    )
-      .map((r) => (r as HTMLElement).innerText)
-      .filter((t) => /^\d+\n\d+/.test(t))
+    // Try each selector until we find one with rows matching the pattern
+    let rows: string[] = []
+    let matchedSelector = ""
+    const matchCounts: Record<string, number> = {}
+
+    for (const sel of selectors) {
+      const els = Array.from(document.querySelectorAll(sel))
+      const texts = els
+        .map((r) => (r as HTMLElement).innerText)
+        .filter((t) => /^\d+\n\d+/.test(t))
+      matchCounts[sel] = texts.length
+      if (texts.length > 0 && rows.length === 0) {
+        rows = texts
+        matchedSelector = sel
+      }
+    }
 
     const noticeEl = document.querySelector("div.notice-marquee span")
     const noticeText = noticeEl
       ? (noticeEl as HTMLElement).innerText.trim()
       : null
 
-    return { frameNumber, rows, noticeText }
-  })
+    // When rows are still empty, capture diagnostic info for Heroku logs
+    const diagnostics = rows.length === 0 ? {
+      bodyPreview: bodyText.slice(0, 500),
+      selectorsTried: selectors,
+      matchCounts,
+      gridClassSamples: Array.from(document.querySelectorAll('[class*="grid"]'))
+        .slice(0, 8)
+        .map(el => `${el.tagName}.${el.className.split(' ').find(c => c.includes('grid')) ?? '?'}`),
+      tagSamples: Array.from(document.body.querySelectorAll('article, li, tr, [class*="row"], [class*="item"]'))
+        .slice(0, 5)
+        .map(el => `<${el.tagName.toLowerCase()} class="${(el as HTMLElement).className.slice(0, 80)}">`),
+    } : undefined
+
+    if (matchedSelector) {
+      console.log(`[scraper-eval] Matched selector: ${matchedSelector} (${rows.length} rows)`)
+    }
+
+    return { frameNumber, rows, noticeText, diagnostics }
+  }, ROW_SELECTORS)
 }
 
 /**
@@ -290,12 +380,17 @@ function parseRows(rawRows: string[]): Partial<Candidate>[] {
       .map((x) => x.trim())
       .filter(Boolean)
 
-    // parts[0]=SrNo  parts[1]=BallotNo  parts[2]=Name  parts[3]=Votes  parts[4]=Place
+    // Site column order (confirmed from live HTML):
+    //   parts[0] = S. No (rank — discarded, we compute our own)
+    //   parts[1] = Ballot No  → serial
+    //   parts[2] = Candidate name
+    //   parts[3] = Place / Judgeship
+    //   parts[4] = Votes  ← LAST column in the grid
     return {
       serial: parts[1] || "",
       name: parts[2] || "",
-      votes: Number(parts[3]) || 0,
-      place: parts[4] || "",
+      place: parts[3] || "",
+      votes: Number(parts[4]) || 0,
       barAssociation: "",
       judgeship: "",
       enrollmentDate: "",
@@ -307,6 +402,7 @@ function parseRows(rawRows: string[]): Partial<Candidate>[] {
     }
   })
 }
+
 
 // ─── Merge + Rank ─────────────────────────────────────────────────────────────
 
@@ -423,52 +519,93 @@ async function runCycleBody(): Promise<void> {
   }
 
   // ── Candidate cache ───────────────────────────────────────────────────────
-  if (data.frameNumber && data.rows.length > 0) {
-    const isNew = !visitedFrames.has(data.frameNumber)
+  // Primary: DOM rows (fast, live)
+  // Fallback: Network-intercepted JSON from counting2026.com's own API
+  //           (works even when bot-detection prevents the React app from rendering)
 
+  const frameNumber = data.frameNumber ?? capturedNetworkFrame
+  const domRows = data.rows
+
+  if (frameNumber && domRows.length > 0) {
+    // ── Path A: DOM scraping succeeded ─────────────────────────────────────
+    const isNew = !visitedFrames.has(frameNumber)
     if (isNew) {
-      visitedFrames.add(data.frameNumber)
-      const parsed = parseRows(data.rows)
+      visitedFrames.add(frameNumber)
+      const parsed = parseRows(domRows)
       const existing = candidateCache?.candidates ?? []
       const merged = mergeAndRank(existing, parsed)
-
       candidateCache = {
         candidates: merged,
         updatedAt: new Date().toISOString(),
         framesCollected: visitedFrames.size,
         totalFrames: TOTAL_FRAMES,
       }
-
       console.log(
-        `[scraper] ✅ Frame ${data.frameNumber}/${TOTAL_FRAMES} — ` +
-        `${merged.length} total candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
+        `[scraper] ✅ DOM Frame ${frameNumber}/${TOTAL_FRAMES} — ` +
+        `${merged.length} candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
       )
-
       if (visitedFrames.size >= TOTAL_FRAMES) {
-        console.log(
-          `[scraper] 🔄 All ${TOTAL_FRAMES} frames collected ` +
-          `(${merged.length} candidates). Will reload for fresh vote data.`
-        )
+        console.log(`[scraper] 🔄 All ${TOTAL_FRAMES} frames collected. Scheduling reload.`)
         visitedFrames.clear()
         pendingReload = true
       }
     } else {
       console.log(
-        `[scraper] Frame ${data.frameNumber} (waiting for rotation… ` +
-        `${visitedFrames.size}/${TOTAL_FRAMES} frames captured)`
+        `[scraper] Frame ${frameNumber} seen (${visitedFrames.size}/${TOTAL_FRAMES} captured)`
       )
     }
-  } else {
-    console.warn(
-      `[scraper] No frame data ` +
-      `(frameNumber=${data.frameNumber}, rows=${data.rows.length})`
+  } else if (capturedNetworkCandidates && capturedNetworkCandidates.length > 0) {
+    // ── Path B: DOM rendering failed, use network-intercepted data ──────────
+    console.log(
+      `[scraper] ⚡ Using network-captured data: ` +
+      `${capturedNetworkCandidates.length} candidates from ${capturedApiUrl?.slice(0, 80) ?? "?"}`
     )
+    // Map from network API shape → our Candidate shape
+    const parsed: Partial<Candidate>[] = capturedNetworkCandidates.map((c) => ({
+      serial: String(c.ballot ?? c.ballotNo ?? c.serial ?? ""),
+      name: String(c.name ?? c.candidateName ?? ""),
+      place: String(c.place ?? c.judgeship ?? c.district ?? ""),
+      votes: Number(c.votes ?? c.voteCount ?? 0),
+      barAssociation: "",
+      judgeship: "",
+      enrollmentDate: "",
+      share: 0,
+      transfer: 0,
+      status: "",
+      standing: "",
+      trend: 0,
+    }))
+    const existing = candidateCache?.candidates ?? []
+    const merged = mergeAndRank(existing, parsed)
+    candidateCache = {
+      candidates: merged,
+      updatedAt: new Date().toISOString(),
+      framesCollected: TOTAL_FRAMES, // treat network data as complete
+      totalFrames: TOTAL_FRAMES,
+    }
+    console.log(
+      `[scraper] ✅ Network data: ${merged.length} candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
+    )
+    capturedNetworkCandidates = null // consume and clear
+    capturedNetworkFrame = null
+  } else {
+    // ── Path C: Nothing available ───────────────────────────────────────────
+    console.warn(
+      `[scraper] No data — DOM rows=${domRows.length}, network=${capturedNetworkCandidates?.length ?? 0}`
+    )
+    if (data.diagnostics) {
+      console.warn("  body:", data.diagnostics.bodyPreview.replace(/\n/g, " | ").slice(0, 300))
+      console.warn("  selectors:", JSON.stringify(data.diagnostics.matchCounts))
+      console.warn("  grid els:", data.diagnostics.gridClassSamples.join(", "))
+      console.warn("  tags:", data.diagnostics.tagSamples.join(", "))
+    }
   }
 
   lastError = null
   lastSuccessfulCycleAt = new Date().toISOString()
   cycleCount++
 }
+
 
 // ─── Background Loop ──────────────────────────────────────────────────────────
 
