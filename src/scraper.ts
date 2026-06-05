@@ -20,7 +20,14 @@
  */
 
 import chromium from "@sparticuz/chromium"
-import puppeteer, { type Browser, type Page } from "puppeteer-core"
+import puppeteerExtra from "puppeteer-extra"
+import StealthPlugin from "puppeteer-extra-plugin-stealth"
+import { type Browser, type Page } from "puppeteer-core"
+
+// Apply stealth ONCE at module load — patches 10+ Cloudflare fingerprinting vectors:
+// navigator.webdriver, navigator.plugins, WebGL, window.chrome, Notification,
+// navigator.languages, screen dimensions, iframe contentWindow, etc.
+puppeteerExtra.use(StealthPlugin())
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -208,26 +215,20 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
   const executablePath = await chromium.executablePath()
   console.log(`[scraper] Chrome: ${executablePath}`)
 
-  browser = await puppeteer.launch({
+  browser = await puppeteerExtra.launch({
     args: [
       ...chromium.args,
       "--disable-application-cache",
       "--disable-cache",
-      // Bot-evasion: prevents navigator.webdriver being set to true
-      "--disable-blink-features=AutomationControlled",
     ],
     defaultViewport: { width: 1280, height: 900 },
     executablePath,
     headless: true,
     timeout: 30_000,
-  })
+  }) as unknown as Browser
 
   page = await browser.newPage()
 
-  // Patch navigator.webdriver so the site doesn't detect headless Chrome
-  await page.evaluateOnNewDocument(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => false })
-  })
 
   // ── Network response interception ───────────────────────────────────────────
   // Capture JSON responses from counting2026.com so we can read candidate data
