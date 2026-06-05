@@ -142,6 +142,36 @@ let pendingReload = true
 let isRunning = false
 let isScraping = false
 
+// ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const GRID_SELECTOR =
+  'article[class*="grid-cols"], div[class*="grid-cols"]'
+
+/**
+ * Wait until at least one candidate row element is present in the DOM.
+ *
+ * counting2026.com is a React SPA: after domcontentloaded the shell loads,
+ * then React hydrates, fetches vote data from the site's own API, and renders
+ * the grid. waitForSelector blocks until that render completes instead of
+ * guessing with a fixed timer.
+ *
+ * Max wait: 30 s (generous for slow Heroku → site network round-trips).
+ * If nothing appears in 30 s we log a warning and continue — readCurrentDOM
+ * will see rows=0 and the cycle will retry in 10 s.
+ */
+async function waitForGrid(pg: Page): Promise<void> {
+  console.log("[scraper] Waiting for candidate grid to render...")
+  try {
+    await pg.waitForSelector(GRID_SELECTOR, { timeout: 30_000 })
+    console.log("[scraper] Candidate grid ready.")
+  } catch {
+    console.warn(
+      "[scraper] Grid not found within 30s — " +
+      "site may still be loading or the selector changed."
+    )
+  }
+}
+
 // ─── Browser Management ───────────────────────────────────────────────────────
 
 async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
@@ -191,14 +221,15 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
   // networkidle2 waits for <2 network connections, which is NEVER true for
   // sites that constantly poll their own API (like counting2026.com).
   await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 30_000 })
-  console.log("[scraper] Initial page load complete.")
+  console.log("[scraper] DOM loaded.")
+
+  // Wait for React to hydrate and render the candidate grid.
+  // domcontentloaded fires before React's data-fetch + render completes,
+  // so we must wait for the actual row elements — not just a fixed timer.
+  await waitForGrid(page)
 
   // Initial load already counts as the reload
   pendingReload = false
-
-  // Settle so the React app can render the first frame
-  console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s after initial load...`)
-  await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
 
   return { browser, page: page! }
 }
@@ -247,8 +278,7 @@ async function readCurrentDOM(pg: Page): Promise<RawPageData> {
 async function reloadForFreshData(pg: Page): Promise<void> {
   console.log("[scraper] Full rotation complete — reloading for fresh vote counts...")
   await pg.reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
-  console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s...`)
-  await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
+  await waitForGrid(pg)
 }
 
 // ─── Row Parsing ──────────────────────────────────────────────────────────────
