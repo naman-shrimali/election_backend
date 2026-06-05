@@ -169,8 +169,7 @@ let capturedApiUrl: string | null = null
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-const GRID_SELECTOR =
-  'article[class*="grid-cols"], div[class*="grid-cols"]'
+
 
 /**
  * Wait until at least one candidate row element is present in the DOM.
@@ -187,7 +186,7 @@ const GRID_SELECTOR =
 async function waitForGrid(pg: Page): Promise<void> {
   console.log("[scraper] Waiting for candidate grid to render...")
   try {
-    await pg.waitForSelector(GRID_SELECTOR, { timeout: 30_000 })
+    await pg.waitForSelector(ARTICLE_SELECTOR, { timeout: 30_000 })
     console.log("[scraper] Candidate grid ready.")
   } catch {
     console.warn(
@@ -282,85 +281,91 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
 
 // ─── Page Extraction ──────────────────────────────────────────────────────────
 
+/** Structured row data extracted directly from DOM elements (no innerText parsing). */
+type RawRow = {
+  siteRank: number  // parts[0]: S.No from the site
+  serial: string    // parts[1]: Ballot No
+  name: string      // h2 inside parts[2]
+  place: string     // p  inside parts[2]
+  votes: number     // parts[3]: last column
+}
+
 type RawPageData = {
   frameNumber: string | null
-  rows: string[]
+  rows: RawRow[]
   noticeText: string | null
-  // Populated only when rows=0 to help debug selector mismatches
+  // Populated only when rows=0 to help debug
   diagnostics?: {
     bodyPreview: string
-    selectorsTried: string[]
-    matchCounts: Record<string, number>
-    gridClassSamples: string[]
-    tagSamples: string[]
+    articleCount: number
+    firstArticleChildCount: number
   }
 }
 
-// All selectors to try, in priority order.
-// We log which one matched so we can narrow down the correct one from logs.
-const ROW_SELECTORS = [
-  'article[class*="grid-cols"]',
-  'div[class*="grid-cols"]',
-  'li[class*="grid-cols"]',
-  'tr[class*="grid-cols"]',
-  '[class*="grid-cols"]',             // any element
-  '[class*="candidate"]',
-  'tbody tr',                         // plain table rows
-]
+/** CSS selector that reliably matches candidate article rows. */
+const ARTICLE_SELECTOR = 'article.grid'
 
 /**
  * Read the current DOM state without reloading the page.
- * The site rotates frames on its own schedule; we just snapshot whatever
- * frame is currently displayed.
+ *
+ * IMPORTANT: We do NOT use article.innerText because CSS Grid can change how
+ * headless Chrome renders text boundaries, producing unexpected whitespace.
+ * Instead we query each child element by its grid column index and read
+ * textContent directly — guaranteed correct regardless of CSS layout.
+ *
+ * Article DOM structure (4 grid columns):
+ *   children[0]  S.No      <div class="text-gold">1</div>
+ *   children[1]  Ballot    <div class="text-slate">182</div>
+ *   children[2]  Name+Pl.  <div class="min-w-0"><h2>NAME</h2><p>PLACE</p></div>
+ *   children[3]  Votes     <div class="text-right">1299</div>
  */
 async function readCurrentDOM(pg: Page): Promise<RawPageData> {
-  return pg.evaluate((selectors: string[]): RawPageData => {
-    const bodyText = document.body?.innerText ?? ""
+  return pg.evaluate((articleSel: string): RawPageData => {
+    const bodyText = document.body?.textContent ?? ""
 
     const frameMatch = bodyText.match(/Frame\s+(\d+)\/(\d+)/i)
     const frameNumber = frameMatch ? frameMatch[1] : null
 
-    // Try each selector until we find one with rows matching the pattern
-    let rows: string[] = []
-    let matchedSelector = ""
-    const matchCounts: Record<string, number> = {}
+    const articles = Array.from(document.querySelectorAll(articleSel))
 
-    for (const sel of selectors) {
-      const els = Array.from(document.querySelectorAll(sel))
-      const texts = els
-        .map((r) => (r as HTMLElement).innerText)
-        .filter((t) => /^\d+\n\d+/.test(t))
-      matchCounts[sel] = texts.length
-      if (texts.length > 0 && rows.length === 0) {
-        rows = texts
-        matchedSelector = sel
-      }
+    const rows: RawRow[] = []
+    for (const art of articles) {
+      const cols = art.children
+      if (cols.length < 4) continue
+
+      const siteRankText = (cols[0] as HTMLElement).textContent?.trim() ?? ""
+      const serialText   = (cols[1] as HTMLElement).textContent?.trim() ?? ""
+      const votesText    = (cols[3] as HTMLElement).textContent?.trim() ?? ""
+
+      // Validate: first two columns must be integers (S.No and Ballot)
+      if (!/^\d+$/.test(siteRankText) || !/^\d+$/.test(serialText)) continue
+
+      const nameEl  = cols[2].querySelector("h2")
+      const placeEl = cols[2].querySelector("p")
+
+      rows.push({
+        siteRank: Number(siteRankText),
+        serial:   serialText,
+        name:     (nameEl  as HTMLElement | null)?.textContent?.trim() ??
+                  (cols[2] as HTMLElement).textContent?.trim() ?? "",
+        place:    (placeEl as HTMLElement | null)?.textContent?.trim() ?? "",
+        votes:    /^\d+$/.test(votesText) ? Number(votesText) : 0,
+      })
     }
 
-    const noticeEl = document.querySelector("div.notice-marquee span")
+    const noticeEl  = document.querySelector("div.notice-marquee span")
     const noticeText = noticeEl
-      ? (noticeEl as HTMLElement).innerText.trim()
+      ? (noticeEl as HTMLElement).textContent?.trim() ?? null
       : null
 
-    // When rows are still empty, capture diagnostic info for Heroku logs
     const diagnostics = rows.length === 0 ? {
-      bodyPreview: bodyText.slice(0, 500),
-      selectorsTried: selectors,
-      matchCounts,
-      gridClassSamples: Array.from(document.querySelectorAll('[class*="grid"]'))
-        .slice(0, 8)
-        .map(el => `${el.tagName}.${el.className.split(' ').find(c => c.includes('grid')) ?? '?'}`),
-      tagSamples: Array.from(document.body.querySelectorAll('article, li, tr, [class*="row"], [class*="item"]'))
-        .slice(0, 5)
-        .map(el => `<${el.tagName.toLowerCase()} class="${(el as HTMLElement).className.slice(0, 80)}">`),
+      bodyPreview:             bodyText.slice(0, 400),
+      articleCount:            articles.length,
+      firstArticleChildCount:  articles[0]?.children.length ?? 0,
     } : undefined
 
-    if (matchedSelector) {
-      console.log(`[scraper-eval] Matched selector: ${matchedSelector} (${rows.length} rows)`)
-    }
-
     return { frameNumber, rows, noticeText, diagnostics }
-  }, ROW_SELECTORS)
+  }, ARTICLE_SELECTOR)
 }
 
 /**
@@ -375,54 +380,24 @@ async function reloadForFreshData(pg: Page): Promise<void> {
 
 // ─── Row Parsing ──────────────────────────────────────────────────────────────
 
-function parseRows(rawRows: string[]): Partial<Candidate>[] {
-  return rawRows.map((text) => {
-    const parts = text
-      .split("\n")
-      .map((x) => x.trim())
-      .filter(Boolean)
-
-    // counting2026.com article innerText layout:
-    //   parts[0]         = S.No (the site's vote rank, always a pure integer)
-    //   parts[1]         = Ballot No
-    //   parts[2]         = Candidate name
-    //   parts[2 or 3]    = Place/Judgeship (may share a line with name in headless)
-    //   parts[last]      = Votes — ALWAYS the last element, always a pure integer
-    //
-    // We must NOT hard-code parts[4] for votes because depending on whether CSS
-    // renders <h2> and <p> on separate lines inside the name/place div, the array
-    // can be 4 or 5 elements long. The last-element approach is bulletproof.
-
-    const siteRank = Number(parts[0]) || 0
-    const serial   = parts[1] || ""
-
-    // Votes: last part, verified to be a pure non-negative integer
-    const lastPart = parts[parts.length - 1] || ""
-    const votes    = parts.length >= 4 && /^\d+$/.test(lastPart)
-      ? Number(lastPart)
-      : 0
-
-    // Name + Place: everything between parts[2] and the votes element
-    const middleEnd = votes > 0 ? parts.length - 1 : parts.length
-    const name  = parts[2] || ""
-    const place = parts.slice(3, middleEnd).join(", ") || ""
-
-    return {
-      siteRank,
-      serial,
-      name,
-      place,
-      votes,
-      barAssociation: "",
-      judgeship: "",
-      enrollmentDate: "",
-      share: 0,
-      transfer: 0,
-      status: "",
-      standing: "",
-      trend: 0,
-    }
-  })
+/** Maps structured DOM rows to Candidate partials. Trivial now that readCurrentDOM
+ *  queries each column element directly instead of splitting innerText strings. */
+function parseRows(rawRows: RawRow[]): Partial<Candidate>[] {
+  return rawRows.map((row) => ({
+    siteRank:      row.siteRank,
+    serial:        row.serial,
+    name:          row.name,
+    place:         row.place,
+    votes:         row.votes,
+    barAssociation: "",
+    judgeship:     "",
+    enrollmentDate: "",
+    share:         0,
+    transfer:      0,
+    status:        "",
+    standing:      "",
+    trend:         0,
+  }))
 }
 
 
@@ -627,9 +602,8 @@ async function runCycleBody(): Promise<void> {
     )
     if (data.diagnostics) {
       console.warn("  body:", data.diagnostics.bodyPreview.replace(/\n/g, " | ").slice(0, 300))
-      console.warn("  selectors:", JSON.stringify(data.diagnostics.matchCounts))
-      console.warn("  grid els:", data.diagnostics.gridClassSamples.join(", "))
-      console.warn("  tags:", data.diagnostics.tagSamples.join(", "))
+      console.warn("  article elements found:", data.diagnostics.articleCount)
+      console.warn("  first article child count:", data.diagnostics.firstArticleChildCount)
     }
   }
 
