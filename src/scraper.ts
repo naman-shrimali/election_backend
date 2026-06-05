@@ -92,7 +92,8 @@ export const SCRAPE_INTERVAL_MS = FRAME_POLL_MS
 
 export type Candidate = {
   id: number
-  rank: number
+  rank: number           // our display rank (1-indexed, always sequential)
+  siteRank: number       // S.No from counting2026.com — authoritative vote order
   serial: string
   name: string
   place: string
@@ -381,17 +382,37 @@ function parseRows(rawRows: string[]): Partial<Candidate>[] {
       .map((x) => x.trim())
       .filter(Boolean)
 
-    // Site column order (confirmed from live HTML):
-    //   parts[0] = S. No (rank — discarded, we compute our own)
-    //   parts[1] = Ballot No  → serial
-    //   parts[2] = Candidate name
-    //   parts[3] = Place / Judgeship
-    //   parts[4] = Votes  ← LAST column in the grid
+    // counting2026.com article innerText layout:
+    //   parts[0]         = S.No (the site's vote rank, always a pure integer)
+    //   parts[1]         = Ballot No
+    //   parts[2]         = Candidate name
+    //   parts[2 or 3]    = Place/Judgeship (may share a line with name in headless)
+    //   parts[last]      = Votes — ALWAYS the last element, always a pure integer
+    //
+    // We must NOT hard-code parts[4] for votes because depending on whether CSS
+    // renders <h2> and <p> on separate lines inside the name/place div, the array
+    // can be 4 or 5 elements long. The last-element approach is bulletproof.
+
+    const siteRank = Number(parts[0]) || 0
+    const serial   = parts[1] || ""
+
+    // Votes: last part, verified to be a pure non-negative integer
+    const lastPart = parts[parts.length - 1] || ""
+    const votes    = parts.length >= 4 && /^\d+$/.test(lastPart)
+      ? Number(lastPart)
+      : 0
+
+    // Name + Place: everything between parts[2] and the votes element
+    const middleEnd = votes > 0 ? parts.length - 1 : parts.length
+    const name  = parts[2] || ""
+    const place = parts.slice(3, middleEnd).join(", ") || ""
+
     return {
-      serial: parts[1] || "",
-      name: parts[2] || "",
-      place: parts[3] || "",
-      votes: Number(parts[4]) || 0,
+      siteRank,
+      serial,
+      name,
+      place,
+      votes,
       barAssociation: "",
       judgeship: "",
       enrollmentDate: "",
@@ -427,11 +448,14 @@ function mergeAndRank(
         trend: newVotes - prev.votes,
         place: raw.place || prev.place,
         name: raw.name || prev.name,
+        // Always update siteRank when we get a fresh value
+        siteRank: raw.siteRank || prev.siteRank,
       })
     } else {
       map.set(serial, {
         id: nextId++,
         rank: 0,
+        siteRank: raw.siteRank || 0,
         serial,
         name: raw.name || "",
         place: raw.place || "",
@@ -449,12 +473,19 @@ function mergeAndRank(
   }
 
   const merged = Array.from(map.values())
-  merged.sort(
-    (a, b) => b.votes - a.votes || Number(a.serial) - Number(b.serial)
-  )
-  merged.forEach((c, i) => {
-    c.rank = i + 1
+
+  // Sort by the site's S.No (siteRank) — counting2026.com already ranks by
+  // votes descending so this preserves the authoritative ordering.
+  // Candidates whose frame hasn't been seen yet have siteRank=0; put them last.
+  merged.sort((a, b) => {
+    if (a.siteRank && b.siteRank) return a.siteRank - b.siteRank
+    if (a.siteRank) return -1  // a has rank, b doesn't → a first
+    if (b.siteRank) return 1   // b has rank, a doesn't → b first
+    return Number(a.serial) - Number(b.serial)  // both unranked → sort by ballot
   })
+
+  // Assign sequential display rank (1-indexed)
+  merged.forEach((c, i) => { c.rank = i + 1 })
   return merged
 }
 
