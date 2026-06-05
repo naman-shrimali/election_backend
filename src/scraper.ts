@@ -29,6 +29,49 @@ const TARGET_URL =
 
 const TOTAL_FRAMES = 12
 
+// ─── Scraper State Machine ────────────────────────────────────────────────────
+
+/**
+ * Lifecycle states that the scraper goes through.
+ * Exposed via getScraperStatus() so API routes can include them in responses.
+ */
+export type ScraperLifecycle =
+  | "initializing"       // process just started, browser not yet launched
+  | "loading"            // browser launching / navigating to site
+  | "collecting"         // actively polling DOM for frame changes
+  | "reloading"          // doing a full page reload after a complete rotation
+  | "error"              // last cycle threw — will retry
+  | "stopped"            // stopScraperLoop() called
+
+export type ScraperStatus = {
+  lifecycle: ScraperLifecycle
+  framesCollectedThisPass: number
+  totalFrames: number
+  candidatesLoaded: number
+  lastSuccessfulCycleAt: string | null  // ISO
+  lastError: string | null
+  cycleCount: number
+  pendingReload: boolean
+}
+
+let scraperLifecycle: ScraperLifecycle = "initializing"
+let lastError: string | null = null
+let lastSuccessfulCycleAt: string | null = null
+let cycleCount = 0
+
+export function getScraperStatus(): ScraperStatus {
+  return {
+    lifecycle: scraperLifecycle,
+    framesCollectedThisPass: visitedFrames.size,
+    totalFrames: TOTAL_FRAMES,
+    candidatesLoaded: candidateCache?.candidates.length ?? 0,
+    lastSuccessfulCycleAt,
+    lastError,
+    cycleCount,
+    pendingReload,
+  }
+}
+
 // How often to poll the DOM for a frame change (no page reload)
 const FRAME_POLL_MS = 10_000
 
@@ -127,6 +170,7 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
     defaultViewport: { width: 1280, height: 900 },
     executablePath,
     headless: true,
+    timeout: 30_000,   // fail fast if Chrome process doesn't become responsive
   })
 
   page = await browser.newPage()
@@ -143,8 +187,10 @@ async function ensureBrowser(): Promise<{ browser: Browser; page: Page }> {
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
   )
 
-  console.log(`[scraper] Navigating to ${TARGET_URL}...`)
-  await page.goto(TARGET_URL, { waitUntil: "networkidle2", timeout: 60_000 })
+  // domcontentloaded fires as soon as HTML is parsed — reliable for SPAs.
+  // networkidle2 waits for <2 network connections, which is NEVER true for
+  // sites that constantly poll their own API (like counting2026.com).
+  await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 30_000 })
   console.log("[scraper] Initial page load complete.")
 
   // Initial load already counts as the reload
@@ -200,7 +246,7 @@ async function readCurrentDOM(pg: Page): Promise<RawPageData> {
  */
 async function reloadForFreshData(pg: Page): Promise<void> {
   console.log("[scraper] Full rotation complete — reloading for fresh vote counts...")
-  await pg.reload({ waitUntil: "networkidle2", timeout: 60_000 })
+  await pg.reload({ waitUntil: "domcontentloaded", timeout: 30_000 })
   console.log(`[scraper] Settling ${POST_RELOAD_SETTLE_MS / 1000}s...`)
   await new Promise<void>((r) => setTimeout(r, POST_RELOAD_SETTLE_MS))
 }
@@ -285,91 +331,113 @@ function mergeAndRank(
   return merged
 }
 
+
 // ─── Single Scrape Cycle ──────────────────────────────────────────────────────
+
+// Hard upper bound on a single cycle — prevents page.goto / puppeteer.launch
+// from hanging forever and blocking scheduleNext() from ever firing.
+const CYCLE_HARD_TIMEOUT_MS = 90_000
 
 async function runScrapeCycle(): Promise<void> {
   if (isScraping) return
   isScraping = true
 
+  const hardTimeout = new Promise<never>((_, reject) =>
+    setTimeout(
+      () => reject(new Error(
+        `Cycle hard-timeout after ${CYCLE_HARD_TIMEOUT_MS / 1000}s — ` +
+        `browser launch or page.goto may be stuck`
+      )),
+      CYCLE_HARD_TIMEOUT_MS
+    )
+  )
+
   try {
-    const { page: pg } = await ensureBrowser()
-
-    // Only do a full reload if a complete rotation just finished
-    // (pendingReload is set after 12 frames are seen, or on errors)
-    if (pendingReload) {
-      await reloadForFreshData(pg)
-      pendingReload = false
-    }
-
-    // Read the current DOM without touching the page —
-    // the site's own timer advances the frame automatically
-    const data = await readCurrentDOM(pg)
-
-    // ── Update notice cache ────────────────────────────────────────────────────
-    if (data.noticeText !== null) {
-      const STOP_PATTERNS = [/counting\s+stop/i, /halt/i, /suspended/i]
-      const maintenanceMode = STOP_PATTERNS.some((p) =>
-        p.test(data.noticeText!)
-      )
-      noticeCache = {
-        text: data.noticeText,
-        maintenanceMode,
-        updatedAt: new Date().toISOString(),
-      }
-    }
-
-    // ── Update candidate cache ─────────────────────────────────────────────────
-    if (data.frameNumber && data.rows.length > 0) {
-      const isNew = !visitedFrames.has(data.frameNumber)
-
-      if (isNew) {
-        visitedFrames.add(data.frameNumber)
-
-        const parsed = parseRows(data.rows)
-        const existing = candidateCache?.candidates ?? []
-        const merged = mergeAndRank(existing, parsed)
-
-        candidateCache = {
-          candidates: merged,
-          updatedAt: new Date().toISOString(),
-          framesCollected: visitedFrames.size,
-          totalFrames: TOTAL_FRAMES,
-        }
-
-        console.log(
-          `[scraper] ✅ Frame ${data.frameNumber}/${TOTAL_FRAMES} — ` +
-          `${merged.length} total candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
-        )
-
-        // After all 12 frames: flag for a fresh reload on the next cycle
-        if (visitedFrames.size >= TOTAL_FRAMES) {
-          console.log(
-            `[scraper] 🔄 All ${TOTAL_FRAMES} frames collected (${merged.length} candidates). ` +
-            `Will reload for fresh vote data.`
-          )
-          visitedFrames.clear()
-          pendingReload = true
-        }
-      } else {
-        // Same frame still showing — just log so we know we're alive
-        console.log(
-          `[scraper] Frame ${data.frameNumber} (waiting for rotation… ` +
-          `${visitedFrames.size}/${TOTAL_FRAMES} frames captured)`
-        )
-      }
-    } else {
-      console.warn(
-        `[scraper] No frame data (frameNumber=${data.frameNumber}, rows=${data.rows.length})`
-      )
-    }
+    await Promise.race([runCycleBody(), hardTimeout])
   } catch (err) {
-    console.error("[scraper] Cycle error:", err)
+    const msg = err instanceof Error ? err.message : String(err)
+    console.error("[scraper] Cycle error:", msg)
+    lastError = msg
+    scraperLifecycle = "error"
+    try { browser?.close() } catch { /* ignore */ }
     browser = null
     page = null
-    pendingReload = true   // force fresh load on recovery
+    pendingReload = true
   } finally {
     isScraping = false
   }
+}
+
+async function runCycleBody(): Promise<void> {
+  scraperLifecycle = "loading"
+  const { page: pg } = await ensureBrowser()
+
+  if (pendingReload) {
+    scraperLifecycle = "reloading"
+    await reloadForFreshData(pg)
+    pendingReload = false
+  }
+
+  scraperLifecycle = "collecting"
+  const data = await readCurrentDOM(pg)
+
+  // ── Notice cache ──────────────────────────────────────────────────────────
+  if (data.noticeText !== null) {
+    const STOP_PATTERNS = [/counting\s+stop/i, /halt/i, /suspended/i]
+    const maintenanceMode = STOP_PATTERNS.some((p) => p.test(data.noticeText!))
+    noticeCache = {
+      text: data.noticeText,
+      maintenanceMode,
+      updatedAt: new Date().toISOString(),
+    }
+  }
+
+  // ── Candidate cache ───────────────────────────────────────────────────────
+  if (data.frameNumber && data.rows.length > 0) {
+    const isNew = !visitedFrames.has(data.frameNumber)
+
+    if (isNew) {
+      visitedFrames.add(data.frameNumber)
+      const parsed = parseRows(data.rows)
+      const existing = candidateCache?.candidates ?? []
+      const merged = mergeAndRank(existing, parsed)
+
+      candidateCache = {
+        candidates: merged,
+        updatedAt: new Date().toISOString(),
+        framesCollected: visitedFrames.size,
+        totalFrames: TOTAL_FRAMES,
+      }
+
+      console.log(
+        `[scraper] ✅ Frame ${data.frameNumber}/${TOTAL_FRAMES} — ` +
+        `${merged.length} total candidates | top: ${merged[0]?.name ?? "?"} ${merged[0]?.votes}v`
+      )
+
+      if (visitedFrames.size >= TOTAL_FRAMES) {
+        console.log(
+          `[scraper] 🔄 All ${TOTAL_FRAMES} frames collected ` +
+          `(${merged.length} candidates). Will reload for fresh vote data.`
+        )
+        visitedFrames.clear()
+        pendingReload = true
+      }
+    } else {
+      console.log(
+        `[scraper] Frame ${data.frameNumber} (waiting for rotation… ` +
+        `${visitedFrames.size}/${TOTAL_FRAMES} frames captured)`
+      )
+    }
+  } else {
+    console.warn(
+      `[scraper] No frame data ` +
+      `(frameNumber=${data.frameNumber}, rows=${data.rows.length})`
+    )
+  }
+
+  lastError = null
+  lastSuccessfulCycleAt = new Date().toISOString()
+  cycleCount++
 }
 
 // ─── Background Loop ──────────────────────────────────────────────────────────
@@ -392,11 +460,13 @@ export function startScraperLoop(): void {
     `target ${TARGET_URL}`
   )
 
-  runScrapeCycle().then(() => scheduleNext())
+  // If the first cycle itself errors/hangs, scheduleNext still fires
+  runScrapeCycle().finally(() => scheduleNext())
 }
 
 export function stopScraperLoop(): void {
   isRunning = false
+  scraperLifecycle = "stopped"
   if (scraperTimer) {
     clearTimeout(scraperTimer)
     scraperTimer = null
