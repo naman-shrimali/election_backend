@@ -143,13 +143,12 @@ app.get("/api/pulse", (_req: Request, res: Response) => {
  * Response: { payload: "<base64>", ts: "<ISO>" }
  */
 app.get("/api/signal", (_req: Request, res: Response) => {
-  const cache = getNoticeCache()
-
-  if (!cache) {
-    res.status(503).json({
-      error: "Notice not yet available — scraper is warming up.",
-    })
-    return
+  // Use whatever the scraper has; if the cache isn't warm yet, serve a
+  // safe default so the frontend never gets a 503 for notice data.
+  const cache = getNoticeCache() ?? {
+    text: "",
+    maintenanceMode: false,
+    updatedAt: new Date().toISOString(),
   }
 
   const payload = encryptPayload(cache, ENCRYPTION_SECRET)
